@@ -1,0 +1,52 @@
+// Script que recoge la media de los valores de retrodispersion de VV en imagenes SAR sentinel del año 2025.
+
+// 1. Polígono
+var huehuetla = ee.FeatureCollection('projects/hid608/assets/huehuetla');
+
+Map.centerObject(huehuetla, 12);
+Map.addLayer(huehuetla, {}, 'Municipio Huehuetla (INEGI)');
+
+// 2. Sentinel-1 (con fechas reales)
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(huehuetla)
+  .filterDate('2025-04-01', '2025-05-20')
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .select('VV')
+  .mean()
+  .clip(huehuetla);
+
+// 3. Reproyectar la imagen a UTM zona 14N ANTES de muestrear
+var s1_utm = s1.reproject({
+  crs: 'EPSG:32614',      // UTM zona 14N para Huehuetla, Puebla
+  scale: 100              // resolución 100 metros
+});
+
+// 4. Muestrear sobre la imagen ya en UTM
+var puntos = s1_utm.sample({
+  region: huehuetla,
+  scale: 100,              
+  geometries: true,        
+  projection: 'EPSG:32614' 
+});
+
+// 5. Extraer coordenadas UTM forzando la transformación de la geometría
+var exportData = puntos.map(function(feat) {
+  // CLAVE: Transformar explícitamente la geometría a UTM antes de pedir las coordenadas
+  var geomUTM = feat.geometry().transform('EPSG:32614', 1); 
+  var coords = geomUTM.coordinates();  
+  
+  return ee.Feature(null, {
+    'easting': coords.get(0),    
+    'northing': coords.get(1),   
+    'head': feat.get('VV')
+  });
+});
+
+// 6. Exportar
+Export.table.toDrive({
+  collection: exportData,
+  description: 'Humedad_Huehuetla_UTM',
+  fileFormat: 'CSV',
+  selectors: ['easting', 'northing', 'head']
+});
