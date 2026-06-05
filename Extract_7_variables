@@ -1,0 +1,168 @@
+// ==============================================================================
+// 🛰️ EXTRACCIÓN DE VARIABLES AMBIENTALES - MUNICIPIO HUEHUETLA
+// ==============================================================================
+// 🌍 FOR 606: Geoestadística aplicada en el estudio de los recursos forestales
+// 👤 Profesora Titular: Dra. Martha Elva Ramírez Guzman
+// 👤 Autor: José Rodriguez Rosales
+// 📅 Fecha: Junio 2026
+//
+// 📝 Descripción:
+// Este script extrae las coordenadas espaciales (easting, northing) junto con 
+// un conjunto de covariables ambientales y topográficas para el área de estudio.
+//
+// 🛰️ Fuentes de información:
+// - Imagen SAR (Sentinel-1): Retrodispersión VV (utilizada para medir humedad).
+// - Imagen Óptica (Sentinel-2): NDVI, NDMI.
+// - Datos Topográficos: Altitud (alt), Pendiente (pend).
+//
+// Variables de salida: easting, northing, VV, alt, pend, ndvi, ndmi
+// ==============================================================================
+
+// 1. Polígono
+var huehuetla = ee.FeatureCollection('projects/hid608/assets/huehuetla_1');
+Map.centerObject(huehuetla, 12);
+Map.addLayer(huehuetla, {color: 'white', fillColor: '00000000', width: 2}, 'Municipio Huehuetla');
+
+// ============================================================
+// 2. SENTINEL-1 — ESCENA ÚNICA
+// ============================================================
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(huehuetla)
+  .filterDate('2025-11-10', '2025-11-20')
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .select('VV')
+  .first()
+  .clip(huehuetla);
+
+var s1_date = ee.Date(s1.get('system:time_start'));
+print('📡 Fecha imagen SAR (S1):', s1_date);
+Map.addLayer(s1, {min: -25, max: 0, palette: ['black','white']}, 'SAR Sentinel-1 VV');
+
+// ============================================================
+// 3. SENTINEL-2 — ESCENA ÚNICA MÁS CERCANA
+// ============================================================
+
+// Función de máscara: SCL debe estar presente cuando se llama
+function maskS2clouds(image) {
+  var scl = image.select('SCL');
+  return image.updateMask(
+    scl.neq(3).and(scl.neq(8)).and(scl.neq(9)).and(scl.neq(10))
+  );
+}
+
+var fecha_inicio = s1_date.advance(-5, 'day');
+var fecha_fin    = s1_date.advance( 5, 'day');
+
+var s2_col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(huehuetla)
+  .filterDate(fecha_inicio, fecha_fin)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80))
+  // ✅ Sin .select() aquí — SCL debe sobrevivir hasta maskS2clouds
+  .sort('CLOUDY_PIXEL_PERCENTAGE', true);
+
+var s2_raw = s2_col.first();
+
+// Enmascarar primero (SCL disponible), luego seleccionar bandas útiles
+var s2 = maskS2clouds(s2_raw)
+  .select(['B2', 'B3', 'B4', 'B8', 'B11'])  // ✅ select DESPUÉS del mask
+  .clip(huehuetla);
+
+print('🛰️  Fecha imagen S2 seleccionada:', ee.Date(s2_raw.get('system:time_start')));
+print('☁️  Nubosidad del tile S2 (%):', s2_raw.get('CLOUDY_PIXEL_PERCENTAGE'));
+
+var ndvi = s2.normalizedDifference(['B8', 'B4']).rename('NDVI');
+var ndmi = s2.normalizedDifference(['B8', 'B11']).rename('NDMI');
+
+Map.addLayer(ndvi, {min: -0.2, max: 1.0, palette: ['FF0000','FFFF00','00AA00']}, 'NDVI');
+Map.addLayer(ndmi, {min: -0.5, max: 0.5, palette: ['FF8000','FFFFFF','0000FF']}, 'NDMI');
+
+// ============================================================
+// 4. DEM SRTM → ALTITUD Y PENDIENTE
+// ============================================================
+var srtm = ee.Image('USGS/SRTMGL1_003').clip(huehuetla);
+
+var slope_pct = ee.Terrain.slope(srtm)
+  .multiply(Math.PI / 180)
+  .tan()
+  .multiply(100)
+  .rename('pendiente');
+
+Map.addLayer(srtm, {min: 200, max: 2500, palette: ['006633','E5FFCC','662A00','D8D8D8','F5F5F5']}, 'Altitud SRTM (msnm)');
+Map.addLayer(slope_pct, {min: 0, max: 100, palette: ['FFFFFF','FFCC00','FF0000']}, 'Pendiente (%)');
+
+// ============================================================
+// 5. APILAR BANDAS Y MUESTREAR
+// ============================================================
+var imagen_multi = s1.rename('valor_vv')
+  .addBands(srtm.rename('altitud_msnm'))
+  .addBands(slope_pct)
+  .addBands(ndvi)
+  .addBands(ndmi);
+
+var puntos = imagen_multi.sample({
+  region: huehuetla,
+  scale: 100,
+  projection: 'EPSG:32614',
+  geometries: true,
+  dropNulls: true
+});
+
+print('Número de puntos muestreados:', puntos.size());
+
+var exportData = puntos.map(function(feat) {
+  var geomUTM = feat.geometry().transform('EPSG:32614', 1);
+  var coords = geomUTM.coordinates();
+  return ee.Feature(null, {
+    'X_UTM':        coords.get(0),
+    'Y_UTM':        coords.get(1),
+    'valor_vv':     feat.get('valor_vv'),
+    'altitud_msnm': feat.get('altitud_msnm'),
+    'pendiente':    feat.get('pendiente'),
+    'NDVI':         feat.get('NDVI'),
+    'NDMI':         feat.get('NDMI')
+  });
+});
+
+// ============================================================
+// 6. EXPORTAR CSV
+// ============================================================
+Export.table.toDrive({
+  collection: exportData,
+  description: 'Variables_Huehuetla_UTM',
+  folder: 'GEE_Huehuetla',
+  fileFormat: 'CSV',
+  selectors: ['X_UTM', 'Y_UTM', 'valor_vv', 'altitud_msnm', 'pendiente', 'NDVI', 'NDMI']
+});
+
+// ============================================================
+// 7. EXPORTAR IMÁGENES
+// ============================================================
+Export.image.toDrive({
+  image: s1.toFloat(),
+  description: 'SAR_S1_VV_Huehuetla',
+  folder: 'GEE_Huehuetla',
+  fileNamePrefix: 'SAR_S1_VV_Huehuetla',
+  region: huehuetla.geometry(),
+  scale: 100, crs: 'EPSG:32614', maxPixels: 1e9, fileFormat: 'GeoTIFF'
+});
+
+Export.image.toDrive({
+  image: srtm.rename('altitud_msnm').toFloat(),
+  description: 'DEM_SRTM_Huehuetla',
+  folder: 'GEE_Huehuetla',
+  fileNamePrefix: 'DEM_SRTM_Huehuetla',
+  region: huehuetla.geometry(),
+  scale: 30, crs: 'EPSG:32614', maxPixels: 1e9, fileFormat: 'GeoTIFF'
+});
+
+Export.image.toDrive({
+  image: s2.select(['B2','B3','B4','B8','B11']).multiply(0.0001).toFloat(),
+  description: 'S2_SR_Huehuetla',
+  folder: 'GEE_Huehuetla',
+  fileNamePrefix: 'S2_SR_Huehuetla',
+  region: huehuetla.geometry(),
+  scale: 10, crs: 'EPSG:32614', maxPixels: 1e9, fileFormat: 'GeoTIFF'
+});
+
+print('✅ Exports configurados. Ve a "Tasks" y ejecuta cada tarea.');
