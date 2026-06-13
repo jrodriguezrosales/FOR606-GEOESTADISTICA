@@ -1,0 +1,170 @@
+// ==============================================================================
+// 🛰️ EXTRACCIÓN DE VARIABLES AMBIENTALES - MUNICIPIO HUEHUETLA
+// ==============================================================================
+// 🌍 FOR 606: Geoestadística aplicada en el estudio de los recursos forestales
+// 👤 Profesora Titular: Dra. Martha Elva Ramírez Guzman
+// 👤 Autor: José Rodriguez Rosales
+// 📅 Fecha: Junio 2026
+//
+// 📝 Descripción:
+// Script adaptado para la extracción de métricas estructurales de Radar (Banda L/C) 
+// y LiDAR (GEDI), junto con índices ópticos y topografía, optimizado para
+// el modelado predictivo de Biomasa Aérea (AGB) y stocks de Carbono.
+//
+// Variables de salida: X_UTM, Y_UTM, L_HH, L_HV, S_HV, GEDI_alt, altitud_msnm, pendiente, NDVI, NDMI
+// ==============================================================================
+
+// 1. Polígono
+var huehuetla = ee.FeatureCollection('projects/hid608/assets/huehuetla_1');
+Map.centerObject(huehuetla, 12);
+Map.addLayer(huehuetla, {color: 'white', fillColor: '00000000', width: 2}, 'Municipio Huehuetla');
+
+// ============================================================
+// 2. RADAR BANDA L (ALOS PALSAR-2 JAXA) -> L_HH, L_HV
+// ============================================================
+var alos = ee.ImageCollection('JAXA/ALOS/PALSAR/YEARLY/SAR_EPOCH')
+  .filterBounds(huehuetla)
+  .filterDate('2022-01-01', '2025-01-01')
+  .median()
+  .clip(huehuetla);
+
+// Conversión matemática de Digital Number (DN) a Decibelios (dB)
+var L_HH = alos.select('HH').pow(2).log10().multiply(10).subtract(83.0).rename('L_HH');
+var L_HV = alos.select('HV').pow(2).log10().multiply(10).subtract(83.0).rename('L_HV');
+
+Map.addLayer(L_HV, {min: -25, max: -5, palette: ['black','green','white']}, 'Banda L (HV) - ALOS');
+
+// ============================================================
+// 3. RADAR PROXY BANDA S (SENTINEL-1 VH) -> S_HV
+// ============================================================
+// Usamos la polarización cruzada VH de S1 como alternante estructural homólogo
+var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(huehuetla)
+  .filterDate('2025-11-10', '2025-11-20')
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))
+  .filter(ee.Filter.eq('instrumentMode', 'IW'))
+  .select('VH')
+  .first()
+  .clip(huehuetla)
+  .rename('S_HV');
+
+var s1_date = ee.Date(s1.get('system:time_start'));
+print('📡 Fecha imagen SAR proxy (S1):', s1_date);
+
+// ============================================================
+// 4. LIDAR ESPACIAL GEDI (ALTURA DEL DOSEL) -> GEDI_alt
+// ============================================================
+// Extracción de la métrica rh100 (altura máxima del dosel en metros)
+var gedi = ee.ImageCollection('LARSE/GEDI/GEDI02_A_002_MONTHLY')
+  .filterBounds(huehuetla)
+  .select('rh100')
+  .mean()
+  .clip(huehuetla)
+  .rename('GEDI_alt');
+
+Map.addLayer(gedi, {min: 0, max: 40, palette: ['blue', 'yellow', 'red']}, 'Altura del Dosel GEDI (m)');
+
+// ============================================================
+// 5. SENTINEL-2 — ESCENA ÚNICA MÁS CERCANA -> NDVI, NDMI
+// ============================================================
+function maskS2clouds(image) {
+  var scl = image.select('SCL');
+  return image.updateMask(
+    scl.neq(3).and(scl.neq(8)).and(scl.neq(9)).and(scl.neq(10))
+  );
+}
+
+var fecha_inicio = s1_date.advance(-5, 'day');
+var fecha_fin    = s1_date.advance( 5, 'day');
+
+var s2_col = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(huehuetla)
+  .filterDate(fecha_inicio, fecha_fin)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 80))
+  .sort('CLOUDY_PIXEL_PERCENTAGE', true);
+
+var s2_raw = s2_col.first();
+
+var s2 = maskS2clouds(s2_raw)
+  .select(['B2', 'B3', 'B4', 'B8', 'B11'])
+  .clip(huehuetla);
+
+var ndvi = s2.normalizedDifference(['B8', 'B4']).rename('NDVI');
+var ndmi = s2.normalizedDifference(['B8', 'B11']).rename('NDMI');
+
+Map.addLayer(ndvi, {min: -0.2, max: 1.0, palette: ['FF0000','FFFF00','00AA00']}, 'NDVI');
+
+// ============================================================
+// 6. DEM SRTM → ALTITUD Y PENDIENTE -> altitud_msnm, pendiente
+// ============================================================
+var srtm = ee.Image('USGS/SRTMGL1_003').clip(huehuetla);
+
+var slope_pct = ee.Terrain.slope(srtm)
+  .multiply(Math.PI / 180)
+  .tan()
+  .multiply(100)
+  .rename('pendiente');
+
+// ============================================================
+// 7. APILAR BANDAS Y MUESTREAR
+// ============================================================
+var imagen_multi = L_HH
+  .addBands(L_HV)
+  .addBands(s1)
+  .addBands(gedi)
+  .addBands(srtm.rename('altitud_msnm'))
+  .addBands(slope_pct)
+  .addBands(ndvi)
+  .addBands(ndmi);
+
+// Escala a 30m para homogeneizar la resolución espacial de los sensores
+var puntos = imagen_multi.sample({
+  region: huehuetla,
+  scale: 30,
+  projection: 'EPSG:32614',
+  geometries: true,
+  dropNulls: true // Descarta zonas sin cobertura LiDAR para mantener la consistencia estructural
+});
+
+print('Número de puntos muestreados:', puntos.size());
+
+var exportData = puntos.map(function(feat) {
+  var geomUTM = feat.geometry().transform('EPSG:32614', 1);
+  var coords = geomUTM.coordinates();
+  return ee.Feature(null, {
+    'X_UTM':         coords.get(0),
+    'Y_UTM':         coords.get(1),
+    'L_HH':          feat.get('L_HH'),
+    'L_HV':          feat.get('L_HV'),
+    'S_HV':          feat.get('S_HV'),
+    'GEDI_alt':      feat.get('GEDI_alt'),
+    'altitud_msnm':  feat.get('altitud_msnm'),
+    'pendiente':     feat.get('pendiente'),
+    'NDVI':          feat.get('NDVI'),
+    'NDMI':          feat.get('NDMI')
+  });
+});
+
+// ============================================================
+// 8. EXPORTAR CSV CON SELECTORES SOLICITADOS
+// ============================================================
+Export.table.toDrive({
+  collection: exportData,
+  description: 'Variables_Biomasa_Huehuetla_UTM',
+  folder: 'GEE_Huehuetla',
+  fileFormat: 'CSV',
+  selectors: ['X_UTM', 'Y_UTM', 'L_HH', 'L_HV', 'S_HV', 'GEDI_alt', 'altitud_msnm', 'pendiente', 'NDVI', 'NDMI']
+});
+
+// ============================================================
+// 9. EXPORTAR IMÁGENES BASE (OPCIONAL PARA MAPEO)
+// ============================================================
+Export.image.toDrive({
+  image: L_HV.toFloat(),
+  description: 'Radar_BandaL_HV_Huehuetla',
+  folder: 'GEE_Huehuetla',
+  region: huehuetla.geometry(),
+  scale: 30, crs: 'EPSG:32614', maxPixels: 1e9
+});
+
+print('✅ Matriz geoestadística configurada con las 10 columnas solicitadas. Ejecuta la tarea en "Tasks".');
