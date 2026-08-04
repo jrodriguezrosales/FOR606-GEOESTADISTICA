@@ -1,38 +1,36 @@
 // ==============================================================================
-// 🛰️ EXTRACCIÓN DE VARIABLES SAR Y OPTICAS - MUNICIPIO HUEHUETLA, PUE.
+// 🛰️ EXTRACCIÓN DE VARIABLES SAR Y ÓPTICAS CON CORRECCIONES FÍSICAS
 // ==============================================================================
 // 🌍 FOR 606: Geoestadística aplicada en el estudio de los recursos forestales
-// 👤 Profesora Titular: Dra. Martha Elva Ramírez Guzman
 // 👤 Autor: José Rodriguez Rosales
-// 📅 Fecha: Agosto 2026
-//
-// 📝 Descripción:
-// Este script extrae las coordenadas espaciales (easting, northing) junto con 
-// un conjunto de covariables ambientales y topográficas para el área de estudio.
-//
-// 🛰️ Fuentes de información:
-// - Imagen SAR (Sentinel-1): Retrodispersión VH, VV, VH/VV, variables de textura.
-// - Imagen Óptica (Sentinel-2): NDVI y NDMI.
-// - Datos Topográficos: Altitud, Pendiente, TWI (HydroSHEDS).
-//
-// Variables de salida: X_UTM, Y_UTM, VV_dB, VH_dB, ratio_VHVV_dB, textura_VH_CV, altitud, pendiente_pct, TWI, NDVI, NDMI.
 // ==============================================================================
 
 // ============================================================
 // 1. ÁREA DE ESTUDIO Y CAPAS VECTORIALES
 // ============================================================
 var huehuetla = ee.FeatureCollection('projects/hid608/assets/huehuetla_1');
-// Capa de puntos generada previamente en QGIS (Muestreo de Hexágonos)
 var fc_muestreo = ee.FeatureCollection('projects/hid608/assets/puntos_muestreo_778');
 
 Map.centerObject(huehuetla, 13);
 Map.addLayer(huehuetla, {color: 'red', fillColor: '00000000', width: 2}, 'Municipio Huehuetla');
-
 var crs_utm = 'EPSG:32614';
 var region_geom = huehuetla.geometry();
 
 // ============================================================
-// 2. SENTINEL-1 — RETRODISPERSIÓN SAR
+// 2. TOPOGRAFÍA BASE (Requerida para correcciones)
+// ============================================================
+var srtm = ee.Image('USGS/SRTMGL1_003');
+var altitud = srtm.rename('altitud');
+// Pendiente y orientación en radianes para trigonometría
+var slope_rad = ee.Terrain.slope(srtm).multiply(Math.PI/180);
+var aspect_rad = ee.Terrain.aspect(srtm).multiply(Math.PI/180);
+
+var slope_pct = slope_rad.tan().multiply(100).rename('pendiente_pct');
+var twi = ee.Image('WWF/HydroSHEDS/15ACC').multiply(463)
+  .divide(slope_rad.tan().max(0.001)).log().rename('TWI');
+
+// ============================================================
+// 3. SENTINEL-1 — SAR (Con Filtro de Speckle)
 // ============================================================
 var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
   .filterBounds(region_geom)
@@ -43,112 +41,116 @@ var s1 = ee.ImageCollection('COPERNICUS/S1_GRD')
   .filter(ee.Filter.eq('orbitProperties_pass', 'DESCENDING'))
   .first();
 
-// Nota: Las bandas de S1 en GEE ya vienen en decibelios (dB)
-var vv_db = s1.select('VV').rename('VV_dB');
-var vh_db = s1.select('VH').rename('VH_dB');
+var vv_db = s1.select('VV');
+var vh_db = s1.select('VH');
 
-// El cociente en dB se calcula mediante resta
-var ratio = vh_db.subtract(vv_db).rename('ratio_VHVV_dB');
+// 🛠️ CORRECCIÓN: Pasar a escala lineal para aplicar filtro espacial (Speckle)
+var vv_lin = ee.Image(10.0).pow(vv_db.divide(10.0));
+var vh_lin = ee.Image(10.0).pow(vh_db.divide(10.0));
 
-// Para una textura (CV) matemáticamente correcta, pasamos de dB a escala lineal
-var vh_linear = ee.Image(10.0).pow(vh_db.divide(10.0));
+// Filtro de Mediana Focal (Radio de 30m) para mitigar el ruido de fase
+var vv_filt_lin = vv_lin.focal_median(30, 'circle', 'meters');
+var vh_filt_lin = vh_lin.focal_median(30, 'circle', 'meters');
 
-// Textura: Coeficiente de Variación (CV = std / mean) en ventana 3x3 sobre valores lineales
+// Regresar a decibelios
+var vv_filt_db = ee.Image(10.0).multiply(vv_filt_lin.log10()).rename('VV_dB');
+var vh_filt_db = ee.Image(10.0).multiply(vh_filt_lin.log10()).rename('VH_dB');
+var ratio = vh_filt_db.subtract(vv_filt_db).rename('ratio_VHVV_dB');
+
+// Textura sobre la imagen ya filtrada (mitiga pepita artificial)
 var kernel3 = ee.Kernel.square(1, 'pixels');
-var vh_mean_lin = vh_linear.reduceNeighborhood({reducer: ee.Reducer.mean(), kernel: kernel3});
-var vh_std_lin  = vh_linear.reduceNeighborhood({reducer: ee.Reducer.stdDev(), kernel: kernel3});
+var vh_mean_lin = vh_filt_lin.reduceNeighborhood({reducer: ee.Reducer.mean(), kernel: kernel3});
+var vh_std_lin  = vh_filt_lin.reduceNeighborhood({reducer: ee.Reducer.stdDev(), kernel: kernel3});
 var textura = vh_std_lin.divide(vh_mean_lin).rename('textura_VH_CV');
 
-// Apilamos el stack SAR final
-var s1_stack = vv_db.addBands(vh_db).addBands(ratio).addBands(textura);
+var s1_stack = vv_filt_db.addBands(vh_filt_db).addBands(ratio).addBands(textura);
 
 // ============================================================
-// 3. SENTINEL-2 — IMAGEN ÓPTICA
+// 4. SENTINEL-2 — ÓPTICA (Con Corrección Topográfica)
 // ============================================================
-function maskS2(image) {
-  var scl = image.select('SCL');
-  return image.updateMask(scl.neq(3).and(scl.neq(8)).and(scl.neq(9)).and(scl.neq(10)));
-}
-
-// Ventana de búsqueda: ±5 días a partir de la imagen SAR
 var s1_date = ee.Date(s1.get('system:time_start'));
-var s2 = maskS2(ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+var s2_raw = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
   .filterBounds(region_geom)
   .filterDate(s1_date.advance(-5, 'day'), s1_date.advance(5, 'day'))
   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60))
   .sort('CLOUDY_PIXEL_PERCENTAGE', true)
-  .first());
+  .first();
 
-var ndvi = s2.normalizedDifference(['B8', 'B4']).rename('NDVI');
-var ndmi = s2.normalizedDifference(['B8', 'B11']).rename('NDMI');
+var scl = s2_raw.select('SCL');
+var s2_masked = s2_raw.updateMask(scl.neq(3).and(scl.neq(8)).and(scl.neq(9)).and(scl.neq(10)));
+var s2_scaled = s2_masked.multiply(0.0001); // Reflectancia real (0-1)
 
-print('📡 Fecha imagen SAR (S1):', s1_date);
-print('🛰️ Fecha imagen S2 seleccionada:', ee.Date(s2.get('system:time_start')));
+// 🛠️ CORRECCIÓN: Corrección Topográfica de Coseno
+// Ángulos solares extraídos de los metadatos (como ee.Number)
+var sun_azimuth_num = ee.Number(s2_raw.get('MEAN_SOLAR_AZIMUTH_ANGLE')).multiply(Math.PI/180);
+var sun_zenith_num = ee.Number(s2_raw.get('MEAN_SOLAR_ZENITH_ANGLE')).multiply(Math.PI/180);
+
+// ⚠️ CONVERSIÓN CRÍTICA: Convertir los números a imágenes constantes para poder operarlos matricialmente con el DEM
+var sun_az_img = ee.Image.constant(sun_azimuth_num);
+var sun_zen_img = ee.Image.constant(sun_zenith_num);
+
+// Ecuación de Iluminación (cos i) - Ahora todas las bases operativas son imágenes (ee.Image)
+var cos_i = sun_zen_img.cos().multiply(slope_rad.cos())
+  .add(sun_zen_img.sin().multiply(slope_rad.sin())
+  .multiply(sun_az_img.subtract(aspect_rad).cos()));
+
+// Evitar división por cero o sobrecorrección en sombras extremas (umbral de 0.1)
+var cos_i_safe = cos_i.max(0.1); 
+var topo_correction_factor = sun_zen_img.cos().divide(cos_i_safe);
+
+// Aplicar factor de corrección a las bandas ópticas
+var b2 = s2_scaled.select('B2').multiply(topo_correction_factor);
+var b4 = s2_scaled.select('B4').multiply(topo_correction_factor);
+var b8 = s2_scaled.select('B8').multiply(topo_correction_factor);
+var b11 = s2_scaled.select('B11').multiply(topo_correction_factor);
+
+// Cálculo de Índices con bandas corregidas topográficamente
+var ndvi = b8.subtract(b4).divide(b8.add(b4)).rename('NDVI');
+var ndmi = b8.subtract(b11).divide(b8.add(b11)).rename('NDMI');
+
+var evi = b8.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+        'NIR': b8, 'RED': b4, 'BLUE': b2
+}).rename('EVI');
+
+var fcover = ndvi.expression(
+    'max(0.0, min(1.0, ((NDVI - 0.15) / (0.90 - 0.15))))', { 'NDVI': ndvi }
+).rename('FCOVER');
+
+var lai = fcover.expression(
+    '-(1.0 / 0.5) * log(1.0 - min(FCOVER, 0.99))', { 'FCOVER': fcover }
+).rename('LAI');
+
 
 // ============================================================
-// 4. TOPOGRAFÍA — DEM, PENDIENTE Y TWI
+// 5. MUESTREO Y EXTRACCIÓN
 // ============================================================
-var srtm = ee.Image('USGS/SRTMGL1_003');
-var altitud = srtm.rename('altitud');
-var slope = ee.Terrain.slope(srtm).multiply(Math.PI/180);
-var slope_pct = slope.tan().multiply(100).rename('pendiente_pct');
-
-// TWI con área de contribución específica derivada de HydroSHEDS
-var twi = ee.Image('WWF/HydroSHEDS/15ACC').multiply(463)
-  .divide(slope.tan().max(0.001)).log().rename('TWI');
-
-// ============================================================
-// 5. MUESTREO (Extracción desde el shapefile de QGIS)
-// ============================================================
-var imagen_final = s1_stack.addBands(altitud).addBands(slope_pct)
-  .addBands(twi).addBands(ndvi).addBands(ndmi);
+var imagen_final = s1_stack
+  .addBands(altitud).addBands(slope_pct).addBands(twi)
+  .addBands(ndvi).addBands(ndmi).addBands(evi)
+  .addBands(fcover).addBands(lai);
 
 var muestras = imagen_final.sampleRegions({
   collection: fc_muestreo,
   scale: 10,
   projection: crs_utm,
   geometries: true,
-  tileScale: 4  // tileScale bajo es suficiente ya que los puntos están definidos
+  tileScale: 4
 });
 
-print('📍 Total de puntos extraídos con valores válidos:', muestras.size());
+print('📍 Puntos extraídos:', muestras.size());
 
-// Asignar las coordenadas UTM a las columnas tabulares del dataset
 var exportData = muestras.map(function(f) {
   var c = f.geometry().transform(crs_utm, 1).coordinates();
   return f.set('X_UTM', c.get(0)).set('Y_UTM', c.get(1));
 });
 
 // ============================================================
-// 6. EXPORTACIONES A GOOGLE DRIVE
+// 6. EXPORTACIÓN A DRIVE
 // ============================================================
 Export.table.toDrive({
   collection: exportData,
-  description: 'BaseDatos_Kriging_Huehuetla',
-  folder: 'GEE_Tesis_Huehuetla',
-  fileFormat: 'CSV',
-  selectors: ['X_UTM','Y_UTM','VV_dB','VH_dB','ratio_VHVV_dB',
-              'textura_VH_CV','altitud','pendiente_pct','TWI','NDVI','NDMI']
+  description: 'BaseDatos_Huehuetla',
+  folder: 'FOR606_Geoestadistica',
+  fileFormat: 'CSV'
 });
-
-Export.image.toDrive({
-  image: ndvi.toFloat(), 
-  description: 'NDVI_S2_Huehuetla',
-  folder: 'GEE_Tesis_Huehuetla', 
-  region: region_geom, 
-  scale: 10, 
-  crs: crs_utm, 
-  maxPixels: 1e10
-});
-
-Export.image.toDrive({
-  image: altitud.toFloat(), 
-  description: 'DEM_SRTM_Huehuetla',
-  folder: 'GEE_Tesis_Huehuetla', 
-  region: region_geom, 
-  scale: 30, 
-  crs: crs_utm, 
-  maxPixels: 1e10
-});
-
-print('✅ Procesamiento finalizado. Los datos están listos para modelado geoestadístico.');
